@@ -1,11 +1,16 @@
+/* Simple pulseaudio control / monitor */
+
+#include <cstdint>
 #include <iomanip>
 #include <iostream>
 #include <locale.h>
-#include <pulse/pulseaudio.h>
+#include <mutex>
 #include <signal.h>
 #include <string>
 #include <thread>
 #include <unistd.h>
+
+#include <pulse/pulseaudio.h>
 
 
 using namespace std;
@@ -30,21 +35,21 @@ struct VolumeAction
 	Target target;
 	Action action;
 	float value;
-	PulseControl *ctrl;
 };
 
-static pa_cvolume volume_control;
+constexpr int CLOSING_RETURN_CODE = 42;
 
 class PulseControl
 {
 public:
 	PulseControl();
 	~PulseControl();
+	PulseControl(const PulseControl&) = delete;
 	bool initialize();
-	void run();
-	void perform_action(VolumeAction *action);
-	void parse_stdin();
 	void close();
+	void run();
+	void perform_action(VolumeAction action);
+	void parse_stdin();
 	void quit_loop(int ret = 0);
 
 private:
@@ -52,10 +57,14 @@ private:
 	static void context_callback(pa_context *c, void *userdata);
 	static void subscribe_callback(pa_context *c, pa_subscription_event_type_t type, uint32_t idx, void *userdata);
 	static void server_info_callback(pa_context *c, const pa_server_info *i, void *userdata);
+
+	static void perform_action_state_callback(pa_operation *op, void *userdata);
+
 	static void default_sink_info_callback(pa_context *c, const pa_sink_info *i, int eol, void *userdata);
 	static void sink_info_callback(pa_context *c, const pa_sink_info *i, int eol, void *userdata);
 	static void default_source_info_callback(pa_context *c, const pa_source_info *i, int eol, void *userdata);
 	static void source_info_callback(pa_context *c, const pa_source_info *i, int eol, void *userdata);
+
 	static void sink_action_callback(pa_context *c, const pa_sink_info *i, int eol, void *userdata);
 	static void source_action_callback(pa_context *c, const pa_source_info *i, int eol, void *userdata);
 
@@ -68,6 +77,12 @@ private:
 	const char* _default_source_name;
 	uint32_t _default_sink_idx;
 	uint32_t _default_source_idx;
+
+	// Structure used to change volume
+	pa_cvolume _volume_control;
+	// Data of next volume action
+	VolumeAction _next_action;
+	mutex _action_mutex;
 };
 
 
@@ -81,8 +96,14 @@ PulseControl::PulseControl():
 {
 }
 
+PulseControl::~PulseControl()
+{
+	close();
+}
+
 bool PulseControl::initialize()
 {
+	/* Initialize main loop */
 	_mainloop = pa_mainloop_new();
 	if (!_mainloop) {
 		cerr << "pa_mainloop_new() failed" << endl;
@@ -95,12 +116,14 @@ bool PulseControl::initialize()
 		return false;
 	}
 
+	/* Register signal API */
 	if (pa_signal_init(_mainloop_api) != 0)
 	{
 		cerr << "pa_signal_init() failed" << endl;
 		return false;
 	}
 
+	/* Register action to CTRL+C */
 	_sigint = pa_signal_new(SIGINT, signal_quit_callback, this);
 	if (!_sigint)
 	{
@@ -109,15 +132,18 @@ bool PulseControl::initialize()
 	}
 	signal(SIGPIPE, SIG_IGN);
 
+	/* Initialize context */
 	_context = pa_context_new(_mainloop_api, "PulseAudio control");
 	if (!_context) {
 		cerr << "pa_context_new() failed" << endl;
 		return false;
 	}
 
+	/* Call context_callback on state change */
 	pa_context_set_state_callback(_context, context_callback, this);
 
-	if (pa_context_connect(_context, NULL, PA_CONTEXT_NOAUTOSPAWN, NULL) < 0) {
+	/* Connect to pulseaudio */
+	if (pa_context_connect(_context, nullptr, PA_CONTEXT_NOAUTOSPAWN, nullptr) < 0) {
 		cerr << "pa_context_connect() failed" << endl;
 		return false;
 	}
@@ -125,125 +151,9 @@ bool PulseControl::initialize()
 	return true;
 }
 
-void PulseControl::run() {
-	while (1) {
-		if (!initialize()) {
-			close();
-			sleep(2);
-			continue;
-		}
-
-		int ret = 0;
-		if (pa_mainloop_run(_mainloop, &ret) < 0) {
-			cerr << "pa_mainloop() failed" << endl;
-		}
-		close();
-
-		if (ret == 1) {
-			return;
-		}
-
-		sleep(2);
-	}
-}
-
-void PulseControl::perform_action(VolumeAction *action)
-{
-	pa_operation *op = nullptr;
-
-	switch (action->target) {
-		case TARGET_SINK:
-			op = pa_context_get_sink_info_by_index(_context, _default_sink_idx, sink_action_callback, action);
-			break;
-		case TARGET_SOURCE:
-			op = pa_context_get_source_info_by_index(_context, _default_source_idx, source_action_callback, action);
-			break;
-	}
-
-	if (op) {
-		pa_operation_unref(op);
-	}
-}
-
-void PulseControl::parse_stdin() {
-	for (string line; getline(cin, line);) {
-		if (!_context) {
-			continue;
-		}
-
-		size_t pos = 0;
-		string token;
-		pos = line.find(' ');
-		if (pos == string::npos) {
-			continue;
-		}
-
-		token = line.substr(0, pos);
-		line.erase(0, pos + 1);
-
-		if (token != "source" and token != "sink") {
-			continue;
-		}
-
-		VolumeAction *action = new VolumeAction();
-		action->target = TARGET_SINK;
-		action->value = 0.0;
-		action->ctrl = this;
-
-		if (token == "source") {
-			action->target = TARGET_SOURCE;
-		}
-
-		if (line == "mute_toggle") {
-			action->action = ACTION_TOGGLE_MUTE;
-			perform_action(action);
-			continue;
-		}
-		if (line == "mute_set") {
-			action->action = ACTION_SET_MUTE;
-			action->value = 1.0;
-			perform_action(action);
-			continue;
-		}
-		if (line == "mute_clear") {
-			action->action = ACTION_SET_MUTE;
-			perform_action(action);
-			continue;
-		}
-
-		pos = line.find(' ');
-		if (pos == string::npos) {
-			delete action;
-			continue;
-		}
-		token = line.substr(0, pos);
-		line.erase(0, pos + 1);
-
-		try {
-			action->value = stof(line);
-		}
-		catch (invalid_argument& /* ia */) {
-			delete action;
-			continue;
-		}
-
-		if (token == "change") {
-			action->action = ACTION_CHANGE_VOLUME;
-			perform_action(action);
-			continue;
-		}
-		if (token == "set") {
-			action->action = ACTION_SET_VOLUME;
-			perform_action(action);
-			continue;
-		}
-
-		delete action;
-	}
-}
-
 void PulseControl::close()
 {
+	// Cleanup resources
 	if (_context) {
 		pa_context_unref(_context);
 		_context = nullptr;
@@ -261,15 +171,167 @@ void PulseControl::close()
 	}
 }
 
-void PulseControl::quit_loop(int ret) {
-	if (_mainloop_api) {
-		_mainloop_api->quit(_mainloop_api, ret);
+void PulseControl::run() {
+	while (1) {
+		// Try initialize or wait 2 seconds
+		if (!initialize()) {
+			close();
+			sleep(2);
+			continue;
+		}
+
+		// Run main loop and clear resources after loop
+		int ret = 0;
+		if (pa_mainloop_run(_mainloop, &ret) < 0) {
+			cerr << "pa_mainloop() failed" << endl;
+		}
+		close();
+
+		// Check if main loop was stopped by quit call
+		if (ret == CLOSING_RETURN_CODE) {
+			// If yes, finish loop
+			return;
+		}
+
+		sleep(2);
 	}
 }
 
-PulseControl::~PulseControl()
+void PulseControl::perform_action(VolumeAction action)
 {
-	close();
+	/* Dispatch volume action to sink / sorces */
+	pa_operation *op = nullptr;
+
+	// Lock mutex to prevent race condition on shared _next_action
+	_action_mutex.lock();
+
+	// Update next action
+	_next_action = action;
+
+	/* Action is performed after info call, because current volume / toggle
+	 * status is required for toggle and volume change action */
+	switch (_next_action.target) {
+		case TARGET_SINK:
+			op = pa_context_get_sink_info_by_index(_context, _default_sink_idx, sink_action_callback, this);
+			break;
+		case TARGET_SOURCE:
+			op = pa_context_get_source_info_by_index(_context, _default_source_idx, source_action_callback, this);
+			break;
+	}
+
+	if (op) {
+		// Unlock after operation
+		pa_operation_set_state_callback(op, perform_action_state_callback, this);
+	}
+	else {
+		_action_mutex.unlock();
+	}
+}
+
+void PulseControl::parse_stdin() {
+	/*
+	 * Parse stdin line by line
+	 *
+	 * Stdin format:
+	 * <target> <operation> [<operand>]
+	 *
+	 * Target is 'sink' or 'source'
+	 * Operations are:
+	 * - mute_toggle
+	 * - mute_set
+	 * - mute_clear
+	 * - set <volume>
+	 * - change [-]<volume>
+	 *
+	 * Volume float point number from 0.0 to 1.0
+	 *
+	 * Change supports negative numbers, for example sink change -0.1 will
+	 * decrease volume by 10%.
+	 */
+	for (string line; getline(cin, line);) {
+		if (!_context) {
+			continue;
+		}
+
+		size_t pos = 0;
+		string token;
+
+		// Find delimiter
+		pos = line.find(' ');
+		if (pos == string::npos) {
+			continue;
+		}
+
+		token = line.substr(0, pos);
+		line.erase(0, pos + 1);
+
+		// Only source and sink targets are available
+		if (token != "source" and token != "sink") {
+			continue;
+		}
+
+		// Create temporary action object
+		VolumeAction action;
+		action.target = TARGET_SINK;
+		action.value = 0.0;
+
+		if (token == "source") {
+			action.target = TARGET_SOURCE;
+		}
+
+		// Process mute actions
+		if (line == "mute_toggle") {
+			action.action = ACTION_TOGGLE_MUTE;
+			perform_action(action);
+			continue;
+		}
+		if (line == "mute_set") {
+			action.action = ACTION_SET_MUTE;
+			action.value = 1.0;
+			perform_action(action);
+			continue;
+		}
+		if (line == "mute_clear") {
+			action.action = ACTION_SET_MUTE;
+			perform_action(action);
+			continue;
+		}
+
+		// Volume needs another operand
+		pos = line.find(' ');
+		if (pos == string::npos) {
+			continue;
+		}
+		token = line.substr(0, pos);
+		line.erase(0, pos + 1);
+
+		// Parse volume
+		try {
+			action.value = stof(line);
+		}
+		catch (invalid_argument& /* ia */) {
+			continue;
+		}
+
+		// Change volume
+		if (token == "change") {
+			action.action = ACTION_CHANGE_VOLUME;
+			perform_action(action);
+			continue;
+		}
+		if (token == "set") {
+			action.action = ACTION_SET_VOLUME;
+			perform_action(action);
+			continue;
+		}
+	}
+}
+
+void PulseControl::quit_loop(int ret) {
+	// Quit main loop with optional return code
+	if (_mainloop_api) {
+		_mainloop_api->quit(_mainloop_api, ret);
+	}
 }
 
 
@@ -278,12 +340,14 @@ void PulseControl::signal_quit_callback(pa_mainloop_api * /* mainloop_api */, pa
 {
 	PulseControl* pulse = static_cast<PulseControl *>(userdata);
 	if (pulse) {
-		pulse->quit_loop(1);
+		// Special code to distinguish between disconnect and signal
+		pulse->quit_loop(CLOSING_RETURN_CODE);
 	}
 }
 
 void PulseControl::context_callback(pa_context *c, void *userdata)
 {
+	// On context state change
 	if (!c || !userdata) {
 		return;
 	}
@@ -298,9 +362,11 @@ void PulseControl::context_callback(pa_context *c, void *userdata)
 		case PA_CONTEXT_SETTING_NAME:
 			break;
 		case PA_CONTEXT_READY:
+			// Check default sink / source
 			op = pa_context_get_server_info(c, server_info_callback, userdata);
+			// Subscribe to events
 			pa_context_set_subscribe_callback(c, subscribe_callback, userdata);
-			pa_context_subscribe(c, static_cast<pa_subscription_mask>(PA_SUBSCRIPTION_MASK_SINK | PA_SUBSCRIPTION_MASK_SOURCE | PA_SUBSCRIPTION_MASK_SERVER | PA_SUBSCRIPTION_MASK_CARD), NULL, NULL);
+			pa_context_subscribe(c, static_cast<pa_subscription_mask>(PA_SUBSCRIPTION_MASK_SINK | PA_SUBSCRIPTION_MASK_SOURCE | PA_SUBSCRIPTION_MASK_SERVER | PA_SUBSCRIPTION_MASK_CARD), nullptr, nullptr);
 			break;
 		default:
 			pulse->quit_loop(0);
@@ -315,6 +381,7 @@ void PulseControl::context_callback(pa_context *c, void *userdata)
 
 void PulseControl::subscribe_callback(pa_context *c, pa_subscription_event_type_t type, uint32_t idx, void *userdata)
 {
+	// Process volume / sink-source change events
 	if (!c || !userdata) {
 		return;
 	}
@@ -350,13 +417,26 @@ void PulseControl::server_info_callback(pa_context *c, const pa_server_info *i, 
 		return;
 	}
 
+	// Set default sink
 	pa_operation *op = pa_context_get_sink_info_by_name(c, i->default_sink_name, default_sink_info_callback, userdata);
 	if (op) {
 		pa_operation_unref(op);
 	}
 
+	// Set default source
 	op = pa_context_get_source_info_by_name(c, i->default_source_name, default_source_info_callback, userdata);
 	if (op) {
+		pa_operation_unref(op);
+	}
+}
+
+
+void PulseControl::perform_action_state_callback(pa_operation *op, void *userdata)
+{
+	// Unlock mutex used to prevent race conditionon on _next_action
+	PulseControl* pulse = static_cast<PulseControl*>(userdata);
+	if (pa_operation_get_state(op) != PA_OPERATION_RUNNING) {
+		pulse->_action_mutex.unlock();
 		pa_operation_unref(op);
 	}
 }
@@ -371,6 +451,7 @@ void PulseControl::default_sink_info_callback(pa_context *c, const pa_sink_info 
 	PulseControl* pulse = static_cast<PulseControl*>(userdata);
 
 	if (i->index != pulse->_default_sink_idx) {
+		// Display default sink
 		cout << "default sink\t" << i->name << endl;
 		pulse->_default_sink_idx = i->index;
 		sink_info_callback(c, i, eol, userdata);
@@ -396,6 +477,7 @@ void PulseControl::sink_info_callback(pa_context *c, const pa_sink_info *i, int 
 		mute_flag = 'M';
 	}
 
+	// Display volume of default sink
 	float volume = (float)pa_cvolume_avg(&(i->volume)) / (float)PA_VOLUME_NORM;
 	cout << "volume sink\t" << default_flag << mute_flag << '\t' << setw(6) << setprecision(5) << fixed << showpoint << volume << "\t" << i->name << endl;
 }
@@ -410,6 +492,7 @@ void PulseControl::default_source_info_callback(pa_context *c, const pa_source_i
 	PulseControl* pulse = static_cast<PulseControl*>(userdata);
 
 	if (i->index != pulse->_default_source_idx) {
+		// Display default source
 		cout << "default source\t" << i->name << endl;
 		pulse->_default_source_idx = i->index;
 		source_info_callback(c, i, eol, userdata);
@@ -435,6 +518,7 @@ void PulseControl::source_info_callback(pa_context *c, const pa_source_info *i, 
 		mute_flag = 'M';
 	}
 
+	// Display volume of default source
 	float volume = (float)pa_cvolume_avg(&(i->volume)) / (float)PA_VOLUME_NORM;
 	cout << "volume source\t" << default_flag << mute_flag << '\t' << setw(6) << setprecision(5) << fixed << showpoint << volume << "\t" << i->name << endl;
 }
@@ -442,102 +526,101 @@ void PulseControl::source_info_callback(pa_context *c, const pa_source_info *i, 
 
 void PulseControl::sink_action_callback(pa_context *c, const pa_sink_info *i, int eol, void *userdata)
 {
+	// Perform action on sink
 	if (!c || !i || !userdata || eol != 0) {
 		return;
 	}
 
-	volume_control.channels = i->volume.channels;
-	for (uint8_t ch = 0; ch < volume_control.channels; ++ch) {
-		volume_control.values[ch] = i->volume.values[ch];
+	PulseControl* pulse = static_cast<PulseControl*>(userdata);
+
+	pulse->_volume_control.channels = i->volume.channels;
+	for (uint8_t ch = 0; ch < pulse->_volume_control.channels; ++ch) {
+		pulse->_volume_control.values[ch] = i->volume.values[ch];
 	}
 
 	pa_operation *op = nullptr;
-	VolumeAction* action = static_cast<VolumeAction *>(userdata);
 	float volume;
-	switch (action->action) {
+	switch (pulse->_next_action.action) {
 		case ACTION_TOGGLE_MUTE:
 			op = pa_context_set_sink_mute_by_index(c, i->index, !i->mute, nullptr, nullptr);
 			break;
 		case ACTION_SET_MUTE:
-			op = pa_context_set_sink_mute_by_index(c, i->index, (int)action->value, nullptr, nullptr);
+			op = pa_context_set_sink_mute_by_index(c, i->index, (int)pulse->_next_action.value, nullptr, nullptr);
 			break;
 		case ACTION_CHANGE_VOLUME:
 			volume = (float)pa_cvolume_avg(&(i->volume)) / float(PA_VOLUME_NORM);
-			volume += action->value;
+			volume += pulse->_next_action.value;
 			if (volume < 0) {
 				volume = 0.0;
 			}
 			if (volume > 1.5) {
 				volume = 1.5;
 			}
-			pa_cvolume_set(&volume_control, volume_control.channels, int(volume * PA_VOLUME_NORM));
-			op = pa_context_set_sink_volume_by_index(c, i->index, &volume_control, nullptr, nullptr);
+			pa_cvolume_set(&pulse->_volume_control, pulse->_volume_control.channels, int(volume * PA_VOLUME_NORM));
+			op = pa_context_set_sink_volume_by_index(c, i->index, &pulse->_volume_control, nullptr, nullptr);
 			break;
 		case ACTION_SET_VOLUME:
-			pa_cvolume_set(&volume_control, volume_control.channels, int(action->value * PA_VOLUME_NORM));
-			op = pa_context_set_sink_volume_by_index(c, i->index, &volume_control, nullptr, nullptr);
+			pa_cvolume_set(&pulse->_volume_control, pulse->_volume_control.channels, int(pulse->_next_action.value * PA_VOLUME_NORM));
+			op = pa_context_set_sink_volume_by_index(c, i->index, &pulse->_volume_control, nullptr, nullptr);
 			break;
 	}
 
 	if (op) {
 		pa_operation_unref(op);
 	}
-
-	delete action;
 }
 
 void PulseControl::source_action_callback(pa_context *c, const pa_source_info *i, int eol, void *userdata)
 {
+	// Perform action on source
 	if (!c || !i || !userdata || eol != 0) {
 		return;
 	}
 
-	volume_control.channels = i->volume.channels;
-	for (uint8_t ch = 0; ch < volume_control.channels; ++ch) {
-		volume_control.values[ch] = i->volume.values[ch];
+	PulseControl* pulse = static_cast<PulseControl*>(userdata);
+
+	pulse->_volume_control.channels = i->volume.channels;
+	for (uint8_t ch = 0; ch < pulse->_volume_control.channels; ++ch) {
+		pulse->_volume_control.values[ch] = i->volume.values[ch];
 	}
 
 	pa_operation *op = nullptr;
-	VolumeAction* action = static_cast<VolumeAction *>(userdata);
 	float volume;
-	switch (action->action) {
+	switch (pulse->_next_action.action) {
 		case ACTION_TOGGLE_MUTE:
 			op = pa_context_set_source_mute_by_index(c, i->index, !i->mute, nullptr, nullptr);
 			break;
 		case ACTION_SET_MUTE:
-			op = pa_context_set_source_mute_by_index(c, i->index, (int)action->value, nullptr, nullptr);
+			op = pa_context_set_source_mute_by_index(c, i->index, (int)pulse->_next_action.value, nullptr, nullptr);
 			break;
 		case ACTION_CHANGE_VOLUME:
 			volume = (float)pa_cvolume_avg(&(i->volume)) / float(PA_VOLUME_NORM);
-			volume += action->value;
+			volume += pulse->_next_action.value;
 			if (volume < 0) {
 				volume = 0.0;
 			}
 			if (volume > 1.5) {
 				volume = 1.5;
 			}
-			pa_cvolume_set(&volume_control, volume_control.channels, int(volume * PA_VOLUME_NORM));
-			op = pa_context_set_source_volume_by_index(c, i->index, &volume_control, nullptr, nullptr);
+			pa_cvolume_set(&pulse->_volume_control, pulse->_volume_control.channels, int(volume * PA_VOLUME_NORM));
+			op = pa_context_set_source_volume_by_index(c, i->index, &pulse->_volume_control, nullptr, nullptr);
 			break;
 		case ACTION_SET_VOLUME:
-			pa_cvolume_set(&volume_control, volume_control.channels, int(action->value * PA_VOLUME_NORM));
-			op = pa_context_set_source_volume_by_index(c, i->index, &volume_control, nullptr, nullptr);
+			pa_cvolume_set(&pulse->_volume_control, pulse->_volume_control.channels, int(pulse->_next_action.value * PA_VOLUME_NORM));
+			op = pa_context_set_source_volume_by_index(c, i->index, &pulse->_volume_control, nullptr, nullptr);
 			break;
 	}
 
 	if (op) {
 		pa_operation_unref(op);
 	}
-
-	delete action;
 }
 
 int main(int, char *[])
 {
 	setlocale(LC_NUMERIC, "C");
-	auto ctrl = PulseControl();
-	std::thread t(&PulseControl::parse_stdin, &ctrl);
-
+	PulseControl ctrl;
+	std::thread parse_thread(&PulseControl::parse_stdin, &ctrl);
 	ctrl.run();
 	return 0;
 }
