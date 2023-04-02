@@ -70,3 +70,11 @@ Examples::
 
    # decrease speaker volume by 10%
    sink change -0.1
+
+Awesome WM widget
+-----------------
+
+This allows to make volume changes and listend to changes without polling. Here
+is screencast from Awesome WM:
+
+.. image:: https://raw.github.com/wiki/mireq/pulsectrl/volume.gif?v=2023-04-02
